@@ -1,0 +1,24 @@
+{
+  "name": "caption-seam",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Explicit caption decisions at 1x edit seams",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:oracle": "python3 tests/oracle.py",
+    "test:browser": "node tests/browser.mjs",
+    "test:consumers": "python3 tests/consumers.py",
+    "check": "npm test && npm run test:oracle && npm run build",
+    "serve": "node scripts/serve.mjs",
+    "package": "python3 scripts/package.py",
+    "example": "node scripts/export-example.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.0"
+  }
+}
