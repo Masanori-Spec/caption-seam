@@ -1,0 +1,79 @@
+name: Verify CaptionSeam
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core-and-independent-oracle:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: git diff --exit-code -- dist/index.html
+  sandboxed-browser-and-native-track:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: npx --no-install playwright install --with-deps chromium
+      - name: Test-only official distribution tools and Japanese system fonts
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg fonts-noto-cjk poppler-utils
+      - run: npm run build
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: caption-seam-browser-evidence
+          path: test-results/browser/
+          if-no-files-found: error
+  ffmpeg-actual-browser-downloads:
+    needs: sandboxed-browser-and-native-track
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: caption-seam-browser-evidence
+          path: test-results/browser
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Check actual downloaded SRT and WebVTT with FFprobe and FFmpeg
+        run: npm run test:consumers
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: caption-seam-ffmpeg-evidence
+          path: test-results/browser/consumer-report.json
+          if-no-files-found: error
