@@ -126,7 +126,29 @@ async function snapshotAt(page, time) {
     };
   }, time);
 }
-async function consume(page, fixture, bytes, label) {
+// HTML requires start <= t < end. Hosted Chromium's paused seek can retain the
+// ending cue at exactly t=end, even for the independent hand-written control.
+// Do not change export intervals or silently treat that as spec conformance.
+// Off-boundary assertions remain strict. Exact observations must be one complete
+// endpoint model and actual downloads must reproduce the control's same snapshot.
+// https://html.spec.whatwg.org/multipage/media.html#time-marches-on
+export function assertBoundarySample(snapshot, position, reference = null) {
+  const specExpected = EXPECTED_NATIVE_CUES.filter(cue => cue.start <= position.time && position.time < cue.end);
+  let endpointModel = 'half-open';
+  if (position.side === 'exact') {
+    const closed = EXPECTED_NATIVE_CUES.filter(cue => cue.start <= position.time && position.time <= cue.end);
+    const actual = JSON.stringify(snapshot.cues);
+    if (actual !== JSON.stringify(specExpected)) {
+      same(snapshot.cues, closed, `exact ${position.time}s: only the known end-inclusive native discrepancy is accepted`);
+      endpointModel = 'native-end-inclusive-discrepancy';
+    }
+    if (reference) same(snapshot.cues, reference.cues, `exact ${position.time}s: actual download must match independent control`);
+  } else {
+    same(snapshot.cues, specExpected, `${position.side} ${position.time}s: strict half-open activeCues`);
+  }
+  return { specExpected, matchesHalfOpenSpec: endpointModel === 'half-open', endpointModel };
+}
+async function consume(page, fixture, bytes, label, referenceSamples = null) {
   const loaded = await loadNativeTrack(page, fixture.bytes, bytes);
   if (loaded.readyState !== 2) throw new Error(`${label}: HTML track never reached LOADED`);
   if (loaded.duration < VIDEO_SECONDS - 0.005) throw new Error(`${label}: test video is too short (${loaded.duration}s)`);
@@ -141,16 +163,86 @@ async function consume(page, fixture, bytes, label) {
   for (const position of positions) {
     const snapshot = await snapshotAt(page, position.time);
     if (Math.abs(snapshot.actualTime - position.time) > 0.001) throw new Error(`${label}: inaccurate video seek ${snapshot.actualTime} != ${position.time}`);
-    const expected = EXPECTED_NATIVE_CUES.filter(cue => cue.start <= position.time && position.time < cue.end);
-    same(snapshot.cues, expected, `${label}: ${position.side} ${position.boundary ?? 0}s activeCues/getCueAsHTML`);
-    // Exact boundaries are sampled twice to demonstrate stable native behavior.
+    const reference = referenceSamples?.find(sample => sample.time === position.time && sample.side === position.side);
+    if (referenceSamples && !reference) throw new Error('Missing independent boundary-control sample');
+    const boundaryCheck = assertBoundarySample(snapshot, position, reference);
+    let repeat = null;
     if (position.side === 'exact') {
-      const repeat = await snapshotAt(page, position.time);
-      same(repeat.cues, expected, `${label}: stable exact ${position.time}s native activeCues`);
+      repeat = await snapshotAt(page, position.time);
+      same(repeat.cues, snapshot.cues, `${label}: stable exact ${position.time}s native activeCues`);
     }
-    samples.push({ ...position, ...snapshot, expected });
+    samples.push({ ...position, ...snapshot, ...boundaryCheck, repeat, referenceCues: reference?.cues ?? null });
   }
   return { label, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length, videoDuration: loaded.duration, nativeParsedCues: loaded.cues, boundarySamples: samples };
+}
+const PLAYBACK_GUARD_SECONDS = 0.03;
+const PLAYBACK_EVENT_TOLERANCE_SECONDS = 0.15;
+// These are explicit test observation windows, not claims of HTML conformance.
+export function assertPlaybackProgression(playback) {
+  if (playback.playbackRate !== 1 || !playback.ended || playback.rateChanges.some(event => event.rate !== 1)) throw new NativeCaptionMismatch('Native playback did not finish at 1x');
+  if (!Number.isFinite(playback.duration) || playback.duration < VIDEO_SECONDS - 0.005) throw new NativeCaptionMismatch('Invalid playback duration');
+  for (const event of [...playback.cueEvents, ...playback.cueChanges, ...playback.rateChanges]) if (!Number.isFinite(event.time) || event.time < 0) throw new NativeCaptionMismatch('Invalid native event media time');
+  const samples = playback.samples;
+  if (!Array.isArray(samples) || samples.length < 50) throw new NativeCaptionMismatch('Insufficient real playback samples');
+  let lastTime = -1;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample.time) || sample.time < 0 || sample.rate !== 1) throw new NativeCaptionMismatch('Invalid sample media time or non-1x playback');
+    if (sample.time < lastTime) throw new NativeCaptionMismatch('Playback media time moved backwards');
+    lastTime = sample.time;
+    if (BOUNDARIES.every(boundary => Math.abs(sample.time - boundary) >= PLAYBACK_GUARD_SECONDS)) {
+      same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `real playback at ${sample.time}s`);
+    }
+  }
+  const boundaryObservations = [];
+  for (const boundary of BOUNDARIES) {
+    const before = samples.filter(sample => sample.time < boundary - PLAYBACK_GUARD_SECONDS).at(-1);
+    const after = samples.find(sample => sample.time > boundary + PLAYBACK_GUARD_SECONDS);
+    if (!before || !after || boundary - before.time > 0.25 || after.time - boundary > 0.25) throw new NativeCaptionMismatch(`Missing close playback observations around ${boundary}s`);
+    for (const sample of [before, after]) same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `playback boundary ${boundary}s`);
+    boundaryObservations.push({ boundary, before, after });
+  }
+  if (!playback.cueChanges.length) throw new NativeCaptionMismatch('No native cuechange events during real playback');
+  const eventObservations = [];
+  for (const cue of EXPECTED_NATIVE_CUES) {
+    for (const type of ['enter', 'exit']) {
+      const events = playback.cueEvents.filter(event => event.type === type && event.start === cue.start && event.end === cue.end && event.text === cue.text);
+      if (events.length !== 1) throw new NativeCaptionMismatch(`Expected one native ${type} event for ${cue.text}, got ${events.length}`);
+      const boundary = type === 'enter' ? cue.start : cue.end;
+      const offset = events[0].time - boundary;
+      if (Math.abs(offset) > PLAYBACK_EVENT_TOLERANCE_SECONDS) throw new NativeCaptionMismatch(`Native ${type} event too far from ${boundary}s: ${offset}s`);
+      if (!playback.cueChanges.some(event => Math.abs(event.time - boundary) <= PLAYBACK_EVENT_TOLERANCE_SECONDS)) throw new NativeCaptionMismatch(`Missing cuechange near ${boundary}s`);
+      eventObservations.push({ ...events[0], boundary, offset });
+    }
+  }
+  if (playback.cueEvents.length !== EXPECTED_NATIVE_CUES.length * 2) throw new NativeCaptionMismatch('Unexpected extra native cue events');
+  return { status: 'pass', guardSeconds: PLAYBACK_GUARD_SECONDS, eventToleranceSeconds: PLAYBACK_EVENT_TOLERANCE_SECONDS, boundaryObservations, eventObservations };
+}
+async function observeRealPlayback(page) {
+  await snapshotAt(page, 0);
+  const playback = await page.evaluate(async () => {
+    const { video, track } = window.__nativeConsumer;
+    const list = () => Array.from(track.track.activeCues || [], cue => ({ start: cue.startTime, end: cue.endTime, text: cue.getCueAsHTML().textContent }));
+    const samples = [{ time: video.currentTime, rate: video.playbackRate, cues: list() }], cueEvents = [], cueChanges = [], rateChanges = [], listeners = [];
+    const listen = (target, type, callback) => { target.addEventListener(type, callback); listeners.push(() => target.removeEventListener(type, callback)); };
+    for (const cue of Array.from(track.track.cues || [])) for (const type of ['enter', 'exit']) listen(cue, type, () => cueEvents.push({ type, time: video.currentTime, start: cue.startTime, end: cue.endTime, text: cue.getCueAsHTML().textContent }));
+    listen(track.track, 'cuechange', () => cueChanges.push({ time: video.currentTime, cues: list() }));
+    listen(video, 'ratechange', () => rateChanges.push({ time: video.currentTime, rate: video.playbackRate }));
+    video.playbackRate = 1;
+    let frame = 0, timeout = 0;
+    try {
+      await new Promise(async (resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('Real 1x native playback timed out')), 30000);
+        listen(video, 'ended', resolve);
+        listen(video, 'error', () => reject(new Error('Real native playback failed')));
+        const sample = () => { samples.push({ time: video.currentTime, rate: video.playbackRate, cues: list() }); if (!video.ended) frame = requestAnimationFrame(sample); };
+        frame = requestAnimationFrame(sample);
+        try { await video.play(); } catch (error) { reject(error); }
+      });
+      samples.push({ time: video.currentTime, rate: video.playbackRate, cues: list() });
+      return { playbackRate: video.playbackRate, ended: video.ended, duration: video.duration, samples, cueEvents, cueChanges, rateChanges };
+    } finally { clearTimeout(timeout); cancelAnimationFrame(frame); video.pause(); listeners.forEach(remove => remove()); }
+  });
+  return playback;
 }
 async function rejectBad(page, fixture, bytes, label) {
   try {
@@ -172,7 +264,7 @@ async function cleanupPage(page) {
 }
 
 export async function verifyNativeTrack(page, actualVttPathOrBytes, { outputDir = 'test-results/browser' } = {}) {
-  const report = { status: 'fail', consumer: 'HTMLVideoElement + actual HTMLTrackElement WebVTT parser', syntheticVideoIsTestOnly: true, expectationSource: 'independent hand-written six-cue fixture', exactBoundaryPolicy: 'start inclusive, end exclusive; every exact boundary sampled twice', epsilonSeconds: EPSILON_SECONDS };
+  const report = { status: 'fail', consumer: 'HTMLVideoElement + actual HTMLTrackElement WebVTT parser', syntheticVideoIsTestOnly: true, expectationSource: 'independent hand-written six-cue fixture', exactBoundaryPolicy: 'Strict half-open before/after; exact snapshots constrained to half-open or observed native end-inclusive model, repeated, and actual download matched to independent control', specification: 'https://html.spec.whatwg.org/multipage/media.html#time-marches-on', epsilonSeconds: EPSILON_SECONDS };
   await fs.mkdir(outputDir, { recursive: true });
   try {
     const bytes = await inputBytes(actualVttPathOrBytes);
@@ -182,7 +274,11 @@ export async function verifyNativeTrack(page, actualVttPathOrBytes, { outputDir 
     report.negativeControls = [];
     report.negativeControls.push(await rejectBad(page, fixture, Buffer.from(POSITIVE_CONTROL.replace('00:00:01.000', '00:00:01.250')), 'bad 250ms cue start'));
     report.negativeControls.push(await rejectBad(page, fixture, Buffer.from(POSITIVE_CONTROL.replace('Last\ncaption', 'Last caption')), 'bad multiline text'));
-    report.actualDownload = await consume(page, fixture, bytes, 'actual browser-downloaded recut.vtt');
+    report.actualDownload = await consume(page, fixture, bytes, 'actual browser-downloaded recut.vtt', report.positiveControl.boundarySamples);
+    report.actualPlayback = await observeRealPlayback(page);
+    report.actualPlayback.checks = assertPlaybackProgression(report.actualPlayback);
+    report.nativeSpecDiscrepancies = report.positiveControl.boundarySamples.filter(sample => !sample.matchesHalfOpenSpec).map(({time,endpointModel,specExpected,cues}) => ({time,endpointModel,specExpected,observed:cues}));
+    report.nativeExactEndConformance = report.nativeSpecDiscrepancies.length ? 'Native exact-end discrepancy observed; output matches independent control, not a browser conformance claim' : 'All sampled exact positions match half-open specification';
     report.status = 'pass';
     return report;
   } catch (error) {
