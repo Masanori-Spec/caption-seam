@@ -190,15 +190,15 @@ export function assertPlaybackProgression(playback) {
     if (sample.time < lastTime) throw new NativeCaptionMismatch('Playback media time moved backwards');
     lastTime = sample.time;
     if (BOUNDARIES.every(boundary => Math.abs(sample.time - boundary) >= PLAYBACK_GUARD_SECONDS)) {
-      same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `real playback at ${sample.time}s`);
+      try { same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `real playback at ${sample.time}s`); } catch (error) { error.playbackTime = sample.time; error.playbackFailure = 'active-state'; error.observedCues = sample.cues; throw error; }
     }
   }
   const boundaryObservations = [];
   for (const boundary of BOUNDARIES) {
     const before = samples.filter(sample => sample.time < boundary - PLAYBACK_GUARD_SECONDS).at(-1);
     const after = samples.find(sample => sample.time > boundary + PLAYBACK_GUARD_SECONDS);
-    if (!before || !after || boundary - before.time > 0.25 || after.time - boundary > 0.25) throw new NativeCaptionMismatch(`Missing close playback observations around ${boundary}s`);
-    for (const sample of [before, after]) same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `playback boundary ${boundary}s`);
+    if (!before || !after || boundary - before.time > 0.25 || after.time - boundary > 0.25) { const error = new NativeCaptionMismatch(`Missing close playback observations around ${boundary}s`); error.playbackBoundary = boundary; error.playbackFailure = 'coverage'; throw error; }
+    for (const sample of [before, after]) { try { same(sample.cues, EXPECTED_NATIVE_CUES.filter(cue => cue.start <= sample.time && sample.time < cue.end), `playback boundary ${boundary}s`); } catch (error) { error.playbackTime = sample.time; error.playbackFailure = 'active-state'; error.observedCues = sample.cues; throw error; } }
     boundaryObservations.push({ boundary, before, after });
   }
   if (!playback.cueChanges.length) throw new NativeCaptionMismatch('No native cuechange events during real playback');
@@ -209,7 +209,7 @@ export function assertPlaybackProgression(playback) {
       if (events.length !== 1) throw new NativeCaptionMismatch(`Expected one native ${type} event for ${cue.text}, got ${events.length}`);
       const boundary = type === 'enter' ? cue.start : cue.end;
       const offset = events[0].time - boundary;
-      if (Math.abs(offset) > PLAYBACK_EVENT_TOLERANCE_SECONDS) throw new NativeCaptionMismatch(`Native ${type} event too far from ${boundary}s: ${offset}s`);
+      if (Math.abs(offset) > PLAYBACK_EVENT_TOLERANCE_SECONDS) { const error = new NativeCaptionMismatch(`Native ${type} event too far from ${boundary}s: ${offset}s`); error.playbackBoundary = boundary; error.playbackFailure = 'late-event'; error.observedEventTime = events[0].time; throw error; }
       if (!playback.cueChanges.some(event => Math.abs(event.time - boundary) <= PLAYBACK_EVENT_TOLERANCE_SECONDS)) throw new NativeCaptionMismatch(`Missing cuechange near ${boundary}s`);
       eventObservations.push({ ...events[0], boundary, offset });
     }
@@ -222,7 +222,7 @@ async function observeRealPlayback(page) {
   const playback = await page.evaluate(async () => {
     const { video, track } = window.__nativeConsumer;
     const list = () => Array.from(track.track.activeCues || [], cue => ({ start: cue.startTime, end: cue.endTime, text: cue.getCueAsHTML().textContent }));
-    const samples = [{ time: video.currentTime, rate: video.playbackRate, cues: list() }], cueEvents = [], cueChanges = [], rateChanges = [], listeners = [];
+    const samples = [{ time: video.currentTime, wallTime: performance.now(), rate: video.playbackRate, cues: list() }], cueEvents = [], cueChanges = [], rateChanges = [], listeners = [];
     const listen = (target, type, callback) => { target.addEventListener(type, callback); listeners.push(() => target.removeEventListener(type, callback)); };
     for (const cue of Array.from(track.track.cues || [])) for (const type of ['enter', 'exit']) listen(cue, type, () => cueEvents.push({ type, time: video.currentTime, start: cue.startTime, end: cue.endTime, text: cue.getCueAsHTML().textContent }));
     listen(track.track, 'cuechange', () => cueChanges.push({ time: video.currentTime, cues: list() }));
@@ -234,15 +234,59 @@ async function observeRealPlayback(page) {
         timeout = setTimeout(() => reject(new Error('Real 1x native playback timed out')), 30000);
         listen(video, 'ended', resolve);
         listen(video, 'error', () => reject(new Error('Real native playback failed')));
-        const sample = () => { samples.push({ time: video.currentTime, rate: video.playbackRate, cues: list() }); if (!video.ended) frame = requestAnimationFrame(sample); };
+        const sample = () => { samples.push({ time: video.currentTime, wallTime: performance.now(), rate: video.playbackRate, cues: list() }); if (!video.ended) frame = requestAnimationFrame(sample); };
         frame = requestAnimationFrame(sample);
         try { await video.play(); } catch (error) { reject(error); }
       });
-      samples.push({ time: video.currentTime, rate: video.playbackRate, cues: list() });
+      samples.push({ time: video.currentTime, wallTime: performance.now(), rate: video.playbackRate, cues: list() });
       return { playbackRate: video.playbackRate, ended: video.ended, duration: video.duration, samples, cueEvents, cueChanges, rateChanges };
     } finally { clearTimeout(timeout); cancelAnimationFrame(frame); video.pause(); listeners.forEach(remove => remove()); }
   });
   return playback;
+}
+// One retry is allowed only when a failing observation sits in an independently
+// measured long scheduling gap across a cue boundary. Assertions are never widened.
+export function diagnosePlaybackScheduling(playback, error) {
+  const gaps = [];
+  for (let i = 1; i < playback.samples.length; i++) {
+    const a = playback.samples[i - 1], b = playback.samples[i];
+    const wallGapMs = b.wallTime - a.wallTime;
+    const crossedBoundaries = BOUNDARIES.filter(boundary => a.time < boundary && boundary <= b.time);
+    if (Number.isFinite(wallGapMs) && wallGapMs > 100 && b.time - a.time > 0.08 && crossedBoundaries.length) gaps.push({ start: a.time, end: b.time, wallGapMs, crossedBoundaries });
+  }
+  const target = Number.isFinite(error.playbackBoundary) ? error.playbackBoundary : error.playbackTime;
+  const candidates = Number.isFinite(target) ? gaps.filter(gap => gap.start < target && target <= gap.end + 0.005) : [];
+  const relevant = candidates.filter(gap => {
+    if (error.playbackFailure === 'active-state') {
+      const knownBeforeGap = EXPECTED_NATIVE_CUES.filter(cue => cue.start <= gap.start && gap.start < cue.end);
+      return JSON.stringify(error.observedCues) === JSON.stringify(knownBeforeGap);
+    }
+    if (error.playbackFailure === 'late-event') return Number.isFinite(error.observedEventTime) && gap.start < error.observedEventTime && error.observedEventTime <= gap.end + 0.005;
+    return error.playbackFailure === 'coverage';
+  });
+  return { retryEligible: error instanceof NativeCaptionMismatch && relevant.length > 0, failureKind: error.playbackFailure ?? null, observedEventTime: error.observedEventTime ?? null, relevant, allBoundaryGaps: gaps, reason: 'Measured wall-clock scheduling gap >100ms across the failing boundary with an exact known stale cue set, immediately delayed event, or missing sampling coverage; retry once with unchanged strict checks' };
+}
+async function verifyPlaybackWithDiagnostics(page, fixture, bytes, label, attempts) {
+  for (let index = 0; index < 2; index++) {
+    if (index) {
+      const loaded = await loadNativeTrack(page, fixture.bytes, bytes);
+      same(loaded.cues, EXPECTED_NATIVE_CUES, `${label}: reloaded native cue times/text`);
+    }
+    const attempt = { index: index + 1, status: 'fail' };
+    attempts.push(attempt);
+    attempt.observations = await observeRealPlayback(page);
+    try {
+      attempt.checks = assertPlaybackProgression(attempt.observations);
+      attempt.status = 'pass';
+      return attempt;
+    } catch (error) {
+      attempt.error = `${error.name}: ${error.message}`;
+      attempt.scheduling = diagnosePlaybackScheduling(attempt.observations, error);
+      if (index || !attempt.scheduling.retryEligible) throw error;
+      attempt.retryReason = attempt.scheduling.reason;
+    }
+  }
+  throw new Error('Unreachable playback verification state');
 }
 async function rejectBad(page, fixture, bytes, label) {
   try {
@@ -271,14 +315,16 @@ export async function verifyNativeTrack(page, actualVttPathOrBytes, { outputDir 
     const fixture = await videoFixture();
     report.ffmpeg = fixture.ffmpeg; report.fixtureCommand = fixture.args;
     report.positiveControl = await consume(page, fixture, Buffer.from(POSITIVE_CONTROL), 'independent positive VTT control');
+    report.nativeSpecDiscrepancies = report.positiveControl.boundarySamples.filter(sample => !sample.matchesHalfOpenSpec).map(({time,endpointModel,specExpected,cues}) => ({time,endpointModel,specExpected,observed:cues}));
+    report.nativeExactEndConformance = report.nativeSpecDiscrepancies.length ? 'Native exact-end discrepancy observed in independent control; actual output parity is checked separately, not a browser conformance claim' : 'All sampled exact positions match half-open specification';
+    report.positiveControlPlaybackAttempts = [];
+    await verifyPlaybackWithDiagnostics(page, fixture, Buffer.from(POSITIVE_CONTROL), 'independent positive VTT control playback', report.positiveControlPlaybackAttempts);
     report.negativeControls = [];
     report.negativeControls.push(await rejectBad(page, fixture, Buffer.from(POSITIVE_CONTROL.replace('00:00:01.000', '00:00:01.250')), 'bad 250ms cue start'));
     report.negativeControls.push(await rejectBad(page, fixture, Buffer.from(POSITIVE_CONTROL.replace('Last\ncaption', 'Last caption')), 'bad multiline text'));
     report.actualDownload = await consume(page, fixture, bytes, 'actual browser-downloaded recut.vtt', report.positiveControl.boundarySamples);
-    report.actualPlayback = await observeRealPlayback(page);
-    report.actualPlayback.checks = assertPlaybackProgression(report.actualPlayback);
-    report.nativeSpecDiscrepancies = report.positiveControl.boundarySamples.filter(sample => !sample.matchesHalfOpenSpec).map(({time,endpointModel,specExpected,cues}) => ({time,endpointModel,specExpected,observed:cues}));
-    report.nativeExactEndConformance = report.nativeSpecDiscrepancies.length ? 'Native exact-end discrepancy observed; output matches independent control, not a browser conformance claim' : 'All sampled exact positions match half-open specification';
+    report.actualPlaybackAttempts = [];
+    await verifyPlaybackWithDiagnostics(page, fixture, bytes, 'actual downloaded VTT playback', report.actualPlaybackAttempts);
     report.status = 'pass';
     return report;
   } catch (error) {

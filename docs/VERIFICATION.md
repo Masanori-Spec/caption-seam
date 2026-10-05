@@ -2,7 +2,7 @@
 
 ## Local candidate checks, 2026-10-05
 
-- 35 Node tests (25 core/contract/security regressions and 10 native-boundary/playback guards): passed
+- 39 Node tests (25 core/contract/security regressions and 14 native-boundary/playback guards): passed
 - Independent Python oracle: 9 self-tests, 919 deterministic cases, 4,079 source cues: passed
 - Oracle outcomes: 818 complete exports and 101 expected empty-export refusals
 - Deterministic standalone build: passed
@@ -31,3 +31,6 @@ The first hosted native run reached its independent hand-written positive contro
 A further real 1× playback pass records native cue `enter`/`exit` and `cuechange` events and animation-frame `activeCues` snapshots through the whole generated video. It requires one enter and exit per expected cue, nearby cuechange evidence, finite monotonic media time, sampled and event-reported 1× rate, and strict active-cue text/time states outside a 30 ms endpoint guard window, including observations on both sides of every boundary. Event offsets must be within 150 ms; that is a declared test observation tolerance, not a standards claim. Those measured offsets and all raw observations are retained. Guard tests reject missing/extra/late events, wrong text, sparse observations, speed changes and incomplete playback.
 
 Hosted run 2 produced readable JA/EN desktop, mobile, enlarged-text and A4 print evidence. Pixel review found a ghosted offscreen skip link in one desktop capture; its unfocused opacity is now zero, with explicit visible-on-focus and hidden-after-focus browser assertions. Updated capture acceptance awaits the rerun.
+
+
+Hosted run 3's real playback failed its strict check at media time 14.151258s. Raw evidence shows a 241 ms animation-frame observation gap across the 14s boundary, followed by cue removal at 14.151844s and its exit event at 14.152176s; the preceding eleven cue events were within roughly 1.2 ms. That failed run is retained, not counted as passing playback. The updated gate records wall-clock sample times and runs real playback for both the independent hand-written control and the actual download. A single diagnostic retry is permitted only if a measured wall gap over 100 ms crosses the same boundary implicated in the failure, and the state is the exact known pre-gap cue set, the event arrives immediately after that gap, or the gap caused missing observation coverage. The retry reloads identical files and uses unchanged strict assertions; both attempts and raw observations remain in the report. A second failure, unrelated gap, wrong payload, missing event, or ordinarily sampled timing error still fails the gate.
